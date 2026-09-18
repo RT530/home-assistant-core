@@ -1,7 +1,6 @@
 """Lovelace dashboard support."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
 import logging
 import os
 from pathlib import Path
@@ -9,7 +8,6 @@ import time
 from typing import TYPE_CHECKING, Any, override
 
 import probatio
-import yaml
 
 from homeassistant.components import websocket_api
 from homeassistant.components.frontend import async_panel_exists
@@ -18,7 +16,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import collection, storage
 from homeassistant.helpers.json import cached_json_fragment, json_fragment
-from homeassistant.util.yaml import SECRET_YAML, Secrets, load_yaml_dict
+from homeassistant.util.yaml import Secrets, load_yaml_dict
 
 from .const import (
     CONF_ALLOW_SINGLE_WORD,
@@ -260,33 +258,34 @@ class LovelaceYAML(LovelaceConfig):
         # masked by a timestamp captured afterwards. Erring this way costs at
         # most one extra reload.
         last_update = time.time()
+        loaded_paths: set[str] = set()
 
         try:
             config = load_yaml_dict(
-                self.path, Secrets(Path(self.hass.config.config_dir))
+                self.path,
+                Secrets(Path(self.hass.config.config_dir)),
+                loaded_paths=loaded_paths,
             )
         except FileNotFoundError:
             raise ConfigNotFound from None
 
         json = cached_json_fragment(config)
-        self._cache = (config, last_update, json, _referenced_files(self.path))
+        # Always watch the dashboard file itself. A loader that has been
+        # replaced -- lovelace_gen does this -- reports nothing, and an empty
+        # set would mean the config is never reloaded at all.
+        loaded_paths.add(self.path)
+        self._cache = (config, last_update, json, _watchable_paths(loaded_paths))
         return is_updated, config, json
 
 
-_INCLUDE_FILE_TAGS = frozenset({"!include"})
-_INCLUDE_DIR_TAGS = frozenset(
-    {
-        "!include_dir_list",
-        "!include_dir_merge_list",
-        "!include_dir_merge_named",
-        "!include_dir_named",
-    }
-)
+def _nearest_existing_path(path: str) -> str:
+    """Return the closest ancestor of a path that exists.
 
-
-def _nearest_existing_dir(path: str) -> str:
-    """Return the closest ancestor of a path that exists."""
-    while not os.path.isdir(path):
+    An ``!include_dir_*`` target that does not exist yet is reported by the
+    loader, but it has no mtime to compare. Watching its nearest existing
+    ancestor notices it being created without treating it as changed forever.
+    """
+    while not os.path.exists(path):
         parent = os.path.dirname(path)
         if parent == path:
             break
@@ -294,80 +293,9 @@ def _nearest_existing_dir(path: str) -> str:
     return path
 
 
-def _walk_include_dir(directory: str) -> Iterator[tuple[str, list[str]]]:
-    """Yield each directory an ``!include_dir_*`` tag walks and its YAML files."""
-    for root, dirs, filenames in os.walk(directory, topdown=True):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        yield (
-            root,
-            [
-                os.path.join(root, basename)
-                for basename in sorted(filenames)
-                if not basename.startswith(".")
-                and basename.endswith(".yaml")
-                and basename != SECRET_YAML
-            ],
-        )
-
-
-def _scan_includes(node: yaml.nodes.Node, directory: str, files: set[str]) -> None:
-    """Walk a composed YAML node tree, following ``!include`` style tags."""
-    if isinstance(node, yaml.nodes.ScalarNode):
-        if node.tag in _INCLUDE_FILE_TAGS:
-            _collect_include_graph(
-                os.path.normpath(os.path.join(directory, node.value)), files
-            )
-        elif node.tag in _INCLUDE_DIR_TAGS:
-            location = os.path.normpath(os.path.join(directory, node.value))
-            # Track the directory itself: adding or removing a file changes its
-            # mtime, which the remaining files cannot reveal. A directory that
-            # does not exist yet is loaded as empty, so track the nearest
-            # existing ancestor instead: creating it changes that ancestor.
-            files.add(_nearest_existing_dir(location))
-            for root, filenames in _walk_include_dir(location):
-                files.add(root)
-                for filename in filenames:
-                    _collect_include_graph(filename, files)
-    elif isinstance(node, yaml.nodes.SequenceNode):
-        for child in node.value:
-            _scan_includes(child, directory, files)
-    elif isinstance(node, yaml.nodes.MappingNode):
-        for key, value in node.value:
-            _scan_includes(key, directory, files)
-            _scan_includes(value, directory, files)
-
-
-def _collect_include_graph(path: str, files: set[str]) -> None:
-    """Add a file and, recursively, everything it includes.
-
-    The file is composed rather than loaded, so no constructor runs and no
-    secret is resolved; only the tags are inspected. This does not rely on the
-    loaded values carrying ``__config_file__``, which scalars cannot do.
-    """
-    # Normalise first: the same file reached as ``a/../b.yaml`` and ``b.yaml``
-    # must compare equal, or the cycle check below lets it through twice.
-    path = os.path.normpath(path)
-    if path in files:
-        return
-    files.add(path)
-
-    try:
-        with open(path, encoding="utf-8") as config_file:
-            node = yaml.compose(config_file, Loader=yaml.SafeLoader)
-    except OSError, yaml.YAMLError:
-        # Unreadable or invalid: loading will raise separately, and the file is
-        # already tracked so a later fix to it still invalidates the cache.
-        return
-
-    if node is not None:
-        _scan_includes(node, os.path.dirname(path), files)
-
-
-def _referenced_files(path: str) -> frozenset[str]:
-    """Return the files a dashboard is built from, including the root file."""
-    files: set[str] = set()
-    _collect_include_graph(path, files)
-    return frozenset(files)
+def _watchable_paths(loaded_paths: set[str]) -> frozenset[str]:
+    """Return the paths to compare against the cache timestamp."""
+    return frozenset(_nearest_existing_path(path) for path in loaded_paths)
 
 
 def _any_file_modified_since(files: frozenset[str], last_update: float) -> bool:

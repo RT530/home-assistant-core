@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.setup import async_setup_component
+from homeassistant.util.yaml import load_yaml_dict
 
 from tests.common import assert_setup_component, async_capture_events
 from tests.typing import WebSocketGenerator
@@ -366,6 +367,13 @@ async def test_lovelace_from_yaml(
     assert len(events) == 2
 
 
+def _loaded_paths(root: Path) -> set[str]:
+    """Return the paths the loader reports for a dashboard file."""
+    paths: set[str] = set()
+    load_yaml_dict(str(root), loaded_paths=paths)
+    return paths
+
+
 def _write(path: Path, content: str) -> None:
     """Write a config file, creating parent directories as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -389,7 +397,7 @@ async def test_referenced_files_follows_real_includes(tmp_path: Path) -> None:
     _write(in_dir, "title: Power\n")
     _write(hidden, "title: Hidden\n")
 
-    files = dashboard._referenced_files(str(root))
+    files = _loaded_paths(root)
 
     assert str(root) in files
     assert str(view) in files
@@ -494,7 +502,7 @@ async def test_yaml_dashboard_reloads_on_nested_include(
         _write(path, f"- title: Level\n  sub: !include level{index}/{index}.yaml\n")
     _write(levels[-1], "value: original\n")
 
-    files = dashboard._referenced_files(str(root))
+    files = _loaded_paths(root)
     assert {str(root), *(str(path) for path in levels)} <= files
 
     def deepest(config: dict[str, Any]) -> Any:
@@ -534,7 +542,7 @@ async def test_yaml_dashboard_follows_nested_include_dirs(
     _write(panel, "items: !include_dir_named items\n")
     _write(items / "d.yaml", "title: D\n")
 
-    files = dashboard._referenced_files(str(root))
+    files = _loaded_paths(root)
 
     # Directories are tracked so that added files are noticed.
     assert str(views) in files
@@ -577,7 +585,7 @@ async def test_yaml_dashboard_follows_absolute_include(
     _write(root, f"views:\n  - !include {view}\n")
     _write(view, "title: original\n")
 
-    assert str(view) in dashboard._referenced_files(str(root))
+    assert str(view) in _loaded_paths(root)
 
     _, config, _ = yaml_dashboard._load_config(False)
     assert config["views"][0]["title"] == "original"
@@ -603,8 +611,10 @@ async def test_yaml_dashboard_reloads_when_include_dir_created(
     _, config, _ = yaml_dashboard._load_config(False)
     assert config["views"] == []
 
-    # Its nearest existing ancestor is tracked in its place.
-    assert str(tmp_path) in dashboard._referenced_files(str(root))
+    # The loader reports the directory even though it does not exist, and the
+    # cache watches its nearest existing ancestor in its place.
+    assert str(views) in _loaded_paths(root)
+    assert dashboard._nearest_existing_path(str(views)) == str(tmp_path)
 
     root_mtime = root.stat().st_mtime
     _write(views / "garage.yaml", "title: Garage\n")
@@ -660,7 +670,7 @@ async def test_yaml_dashboard_normalises_include_paths(
     )
     _write(view, "title: original\n")
 
-    files = dashboard._referenced_files(str(root))
+    files = _loaded_paths(root)
     assert str(view) in files
     assert not any(".." in path for path in files)
 

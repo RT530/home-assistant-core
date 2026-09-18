@@ -38,29 +38,41 @@ class YamlTypeError(HomeAssistantError):
 
 
 def load_yaml(
-    fname: str | os.PathLike[str], secrets: Secrets | None = None
+    fname: str | os.PathLike[str],
+    secrets: Secrets | None = None,
+    *,
+    loaded_paths: set[str] | None = None,
 ) -> JSON_TYPE | None:
     """Load a YAML file.
 
     If opening the file raises an OSError it will be wrapped in a HomeAssistantError,
     except for FileNotFoundError which will be re-raised.
+
+    When ``loaded_paths`` is given, every file read and every directory consulted
+    by an ``!include``-family tag is added to it.
     """
     try:
-        return load_annotated_yaml(fname, secrets)
+        return load_annotated_yaml(fname, secrets, loaded_paths=loaded_paths)
     except annotatedyaml.YAMLException as exc:
         raise HomeAssistantError(str(exc)) from exc
 
 
 def load_yaml_dict(
-    fname: str | os.PathLike[str], secrets: Secrets | None = None
+    fname: str | os.PathLike[str],
+    secrets: Secrets | None = None,
+    *,
+    loaded_paths: set[str] | None = None,
 ) -> dict:
     """Load a YAML file and ensure the top level is a dict.
 
     Raise if the top level is not a dict.
     Return an empty dict if the file is empty.
+
+    When ``loaded_paths`` is given, every file read and every directory consulted
+    by an ``!include``-family tag is added to it.
     """
     try:
-        return load_annotated_yaml_dict(fname, secrets)
+        return load_annotated_yaml_dict(fname, secrets, loaded_paths=loaded_paths)
     except annotatedyaml.YamlTypeError as exc:
         raise YamlTypeError(str(exc)) from exc
     except annotatedyaml.YAMLException as exc:
